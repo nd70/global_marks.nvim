@@ -2,20 +2,23 @@ local M = {}
 local api = vim.api
 local fn = vim.fn
 
--- config defaults
+-- Defaults
 M.opts = {
-	sign_prefix = "GlobalMarkSign", -- base name; per-mark sign will be sign_prefix .. "_" .. mark
+	sign_prefix = "GlobalMarkSign", -- base sign name; actual sign will be sign_prefix .. "_" .. mark
 	persist_file = fn.stdpath("data") .. "/global_marks.json",
 	sign_priority = 10,
+	use_theme_color = true, -- try to reuse colors from colorscheme
 }
 
--- state
-M.marks = {} -- map mark -> {bufnr=, row=, col=, sign_id=, sign_name=}
+-- State
+M.marks = {} -- map mark -> { bufnr=, row=, col=, sign_id=, sign_name= }
 M.next_sign_id = 1000
-M.defined_signs = {} -- map mark -> true when a sign_name has been defined
+M.defined_signs = {} -- mark -> true when sign/hil exists
 M._fallback_installed = false
 
--- helpers
+-- -----------------------
+-- Helpers: mark normalization
+-- -----------------------
 local function norm_mark(mark)
 	if not mark then
 		return nil
@@ -27,24 +30,92 @@ local function norm_mark(mark)
 	return s:sub(1, 1)
 end
 
--- define a sign for a specific mark char
-local function ensure_sign_for_mark(mark)
-	local sign_name = M.opts.sign_prefix .. "_" .. mark
-	if M.defined_signs[mark] then
-		return sign_name
+-- -----------------------
+-- Color utilities
+-- -----------------------
+-- Try to get a foreground color (hex) from common highlight groups in the current colorscheme.
+local function get_theme_fg_hex()
+	local candidates = {
+		"Identifier",
+		"Function",
+		"Constant",
+		"String",
+		"Type",
+		"Keyword",
+		"Statement",
+		"Number",
+		"Special",
+		"Boolean",
+	}
+	for _, name in ipairs(candidates) do
+		local ok, hl = pcall(vim.api.nvim_get_hl_by_name, name, true)
+		if ok and hl and hl.foreground then
+			return string.format("#%06x", hl.foreground)
+		end
 	end
-	-- Define sign with the mark character as text
-	pcall(fn.sign_define, sign_name, { text = mark, texthl = "Comment" })
+	return nil
+end
+
+-- fallback palette (nice for dark backgrounds)
+local fallback_palette = {
+	"#4FD6BE", -- teal
+	"#6EE7B7",
+	"#7AD3D0",
+	"#C099FF", -- mauve
+	"#D6B3FF",
+	"#9AE6B4",
+	"#64D3C8",
+	"#B49DFF",
+}
+
+local function palette_for_mark(mark)
+	local code = (type(mark) == "string" and string.byte(mark) or 0) or 0
+	local idx = (code % #fallback_palette) + 1
+	return fallback_palette[idx]
+end
+
+-- Create or update highlight group for a mark; returns highlight group name
+local function ensure_highlight_for_mark(mark)
+	local hl_name = "GlobalMarkHL_" .. mark
+	local fg = nil
+	if M.opts.use_theme_color then
+		local ok, res = pcall(get_theme_fg_hex)
+		if ok then
+			fg = res
+		end
+	end
+	if not fg then
+		fg = palette_for_mark(mark)
+	end
+	-- Use nvim_set_hl (Neovim 0.7+). Wrap in pcall for safety.
+	pcall(vim.api.nvim_set_hl, 0, hl_name, { fg = fg })
+	return hl_name
+end
+
+-- -----------------------
+-- Sign management
+-- -----------------------
+local function sign_name_for_mark(mark)
+	return M.opts.sign_prefix .. "_" .. mark
+end
+
+local function define_sign_for_mark(mark)
+	if M.defined_signs[mark] then
+		return sign_name_for_mark(mark)
+	end
+	local sign_name = sign_name_for_mark(mark)
+	local hl = ensure_highlight_for_mark(mark)
+	-- define sign with the mark character as text and highlight as texthl
+	pcall(fn.sign_define, sign_name, { text = mark, texthl = hl })
 	M.defined_signs[mark] = true
 	return sign_name
 end
 
--- place sign by id using per-mark sign name
 local function place_sign_id(id, sign_name, bufnr, row)
 	pcall(fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
 end
 
--- Place/record a mark sign
+-- Place / record a mark sign
 function M.place_sign(mark, bufnr, row, col)
 	if not mark or not bufnr or not row then
 		return
@@ -56,12 +127,12 @@ function M.place_sign(mark, bufnr, row, col)
 		M.next_sign_id = M.next_sign_id + 1
 		id = M.next_sign_id
 	end
-	local sign_name = ensure_sign_for_mark(mark)
+	local sign_name = define_sign_for_mark(mark)
 	M.marks[mark] = { bufnr = bufnr, row = row, col = col or 0, sign_id = id, sign_name = sign_name }
 	place_sign_id(id, sign_name, bufnr, row)
 end
 
--- remove sign and internal record for mark
+-- Remove sign and internal record
 function M.remove_sign(mark)
 	local info = M.marks[mark]
 	if not info then
@@ -71,10 +142,12 @@ function M.remove_sign(mark)
 		pcall(fn.sign_unplace, "global_marks", { id = info.sign_id, buffer = info.bufnr })
 	end
 	M.marks[mark] = nil
-	-- keep sign definition to avoid repeatedly defining it; optional: undefine here if desired
+	-- keep highlight/sign definition to avoid re-defining; that is cheap
 end
 
--- persistence
+-- -----------------------
+-- Persistence
+-- -----------------------
 function M.save()
 	local ok, json = pcall(fn.json_encode, M.marks)
 	if not ok or not json then
@@ -101,27 +174,28 @@ function M.load()
 		return
 	end
 	M.marks = dec
-	-- ensure sign ids & sign definitions; place signs for buffers currently loaded
+	-- ensure sign ids and place signs for loaded buffers
 	for mark, info in pairs(M.marks) do
 		if not info.sign_id then
 			M.next_sign_id = M.next_sign_id + 1
 			info.sign_id = M.next_sign_id
 		end
-		info.sign_name = M.opts.sign_prefix .. "_" .. mark
-		ensure_sign_for_mark(mark)
+		info.sign_name = sign_name_for_mark(mark)
+		define_sign_for_mark(mark)
 		if info.bufnr and api.nvim_buf_is_loaded(info.bufnr) and info.row and info.row > 0 then
 			place_sign_id(info.sign_id, info.sign_name, info.bufnr, info.row)
 		end
 	end
 end
 
--- Called when a mark is set
+-- -----------------------
+-- Mark events handler
+-- -----------------------
 function M.on_mark_set(mark)
 	mark = norm_mark(mark)
 	if not mark then
 		return
 	end
-
 	local ok, pos = pcall(fn.getpos, "'" .. mark)
 	if not ok or type(pos) ~= "table" then
 		return
@@ -129,21 +203,19 @@ function M.on_mark_set(mark)
 	local bufnr = tonumber(pos[1]) or api.nvim_get_current_buf()
 	local row = tonumber(pos[2]) or 0
 	local col = tonumber(pos[3]) or 0
-
 	if row == 0 then
 		M.remove_sign(mark)
 		return
 	end
-
-	-- lowercase marks are buffer-local
 	if mark:match("%l") then
 		bufnr = api.nvim_get_current_buf()
 	end
-
 	M.place_sign(mark, bufnr, row, col)
 end
 
--- Jump to a mark (only if its buffer is visible in a window)
+-- -----------------------
+-- Jump / delete / clear / list / UI
+-- -----------------------
 function M.jump(mark)
 	mark = norm_mark(mark)
 	if not mark then
@@ -162,8 +234,7 @@ function M.jump(mark)
 	for _, win in ipairs(api.nvim_list_wins()) do
 		if api.nvim_win_get_buf(win) == bufnr then
 			api.nvim_set_current_win(win)
-			-- info.col is 1-indexed from getpos; nvim_win_set_cursor expects 0-index col
-			local col0 = math.max((info.col or 1) - 1, 0)
+			local col0 = math.max((info.col or 1) - 1, 0) -- nvim_win_set_cursor expects 0-index col
 			api.nvim_win_set_cursor(win, { info.row, col0 })
 			return
 		end
@@ -171,7 +242,6 @@ function M.jump(mark)
 	print(("Buffer for mark '%s' is not open in any split. Open it to jump."):format(mark))
 end
 
--- Delete a single mark
 function M.delete(mark)
 	mark = norm_mark(mark)
 	if not mark then
@@ -181,9 +251,8 @@ function M.delete(mark)
 	M.remove_sign(mark)
 end
 
--- Clear marks for all currently loaded buffers
+-- Clear marks only in loaded/open buffers (as requested)
 function M.clear()
-	-- iterate a copy because remove_sign mutates M.marks
 	local to_clear = {}
 	for m, info in pairs(M.marks) do
 		if info.bufnr and api.nvim_buf_is_loaded(info.bufnr) then
@@ -196,7 +265,6 @@ function M.clear()
 	end
 end
 
--- list & UI
 function M.list()
 	local out = {}
 	for m, info in pairs(M.marks) do
@@ -223,7 +291,7 @@ function M.show_list()
 		table.insert(choices, string.format("%s — %s:%d", v.mark, name, v.row or 0))
 	end
 
-	local ok = pcall(require, "telescope")
+	local ok, _ = pcall(require, "telescope")
 	if ok then
 		local pickers = require("telescope.pickers")
 		local finders = require("telescope.finders")
@@ -255,7 +323,9 @@ function M.show_list()
 	end
 end
 
--- Try creating MarkSet API or vimscript autocmd; fallback to mapping if necessary.
+-- -----------------------
+-- Robust MarkSet creation & fallback mapping
+-- -----------------------
 local function try_create_markset_api(aug)
 	local ok = pcall(function()
 		api.nvim_create_autocmd("MarkSet", {
@@ -284,16 +354,13 @@ local function try_create_markset_cmd()
 	return ok1 and ok2 and ok3 and ok4
 end
 
--- fallback mapping install/remove
 local function install_fallback_mapping()
 	local maps = api.nvim_get_keymap("n")
 	for _, mp in ipairs(maps) do
 		if mp.lhs == "m" then
-			-- user has a mapping; don't override
-			return false
+			return false -- user mapping exists; do not override
 		end
 	end
-	-- ensure no previous mapping remains
 	pcall(api.nvim_del_keymap, "n", "m")
 	api.nvim_set_keymap("n", "m", "", {
 		callback = function()
@@ -301,7 +368,7 @@ local function install_fallback_mapping()
 			if not ok or not ch or ch == "" then
 				return
 			end
-			pcall(fn.execute, "normal! m" .. ch) -- ensure builtin behavior
+			pcall(fn.execute, "normal! m" .. ch)
 			local loaded, gm = pcall(require, "global_marks")
 			if loaded and gm and type(gm.on_mark_set) == "function" then
 				pcall(gm.on_mark_set, ch)
@@ -321,9 +388,8 @@ local function remove_fallback_mapping()
 	end
 end
 
--- Module-load time detection & fallback install so marks work immediately.
+-- Module-load detection: try to create MarkSet now; if not possible install fallback mapping
 do
-	-- attempt to detect support for MarkSet; if not available, install fallback mapping now
 	local aug_ok, aug = pcall(api.nvim_create_augroup, "GlobalMarksDetect", { clear = true })
 	local created = false
 	if aug_ok and aug then
@@ -331,7 +397,7 @@ do
 		if not created then
 			created = try_create_markset_cmd()
 		end
-		-- cleanup detect group
+		-- cleanup detection group
 		pcall(vim.cmd, "augroup GlobalMarksDetect")
 		pcall(vim.cmd, "autocmd!")
 		pcall(vim.cmd, "augroup END")
@@ -341,24 +407,28 @@ do
 	end
 end
 
--- setup: create autocmds, load persistence, register commands
+-- -----------------------
+-- Setup (call in lazy config or manually)
+-- -----------------------
 function M.setup(opts)
 	if opts then
 		M.opts = vim.tbl_extend("force", M.opts, opts)
 	end
+
+	-- load persisted marks & define signs for those marks
 	M.load()
-	-- create proper autocmd group and attempts to create MarkSet (api or cmd)
+
+	-- create real autocmd group and try to install MarkSet; if succeed, remove fallback
 	local aug = api.nvim_create_augroup("GlobalMarks", { clear = true })
 	local created = try_create_markset_api(aug)
 	if not created then
 		created = try_create_markset_cmd()
 	end
 	if created then
-		-- if real MarkSet now available and fallback previously installed, remove fallback
 		remove_fallback_mapping()
 	end
 
-	-- Save on exit
+	-- Save marks on exit
 	api.nvim_create_autocmd({ "VimLeavePre", "QuitPre" }, {
 		group = aug,
 		callback = function()
@@ -366,7 +436,7 @@ function M.setup(opts)
 		end,
 	})
 
-	-- Buf wipe/delete: remove signs for marks whose buffer got wiped
+	-- Remove signs when buffers are wiped/deleted
 	api.nvim_create_autocmd({ "BufWipeout", "BufDelete" }, {
 		group = aug,
 		callback = function(ev)
@@ -389,13 +459,26 @@ function M.setup(opts)
 			end
 			for m, info in pairs(M.marks) do
 				if info.bufnr == bufnr and info.row and info.row > 0 and info.sign_id then
-					place_sign_id(info.sign_id, info.sign_name or (M.opts.sign_prefix .. "_" .. m), bufnr, info.row)
+					place_sign_id(info.sign_id, info.sign_name or sign_name_for_mark(m), bufnr, info.row)
 				end
 			end
 		end,
 	})
 
-	-- user commands
+	-- Recompute per-mark highlights when colorscheme changes
+	api.nvim_create_autocmd("ColorScheme", {
+		group = aug,
+		callback = function()
+			for mark, _ in pairs(M.defined_signs) do
+				-- recompute highlight and redefine sign to pick up new texthl
+				local hl = ensure_highlight_for_mark(mark)
+				local sign = sign_name_for_mark(mark)
+				pcall(fn.sign_define, sign, { text = mark, texthl = hl })
+			end
+		end,
+	})
+
+	-- Commands
 	api.nvim_create_user_command("GMarksList", function()
 		M.show_list()
 	end, {})
