@@ -375,19 +375,28 @@ function M.show_list()
 		local conf = require("telescope.config").values
 		local actions = require("telescope.actions")
 		local action_state = require("telescope.actions.state")
+
 		pickers
 			.new({}, {
 				prompt_title = "Global Marks",
 				finder = finders.new_table({ results = choices }),
 				sorter = conf.generic_sorter({}),
 				attach_mappings = function(prompt_bufnr, map)
-					actions.select_default:replace(function()
+					-- Replace default select action with one that closes the picker correctly
+					actions.select_default:replace(function(prompt_bufnr_inner, map_inner)
 						local sel = action_state.get_selected_entry()
+						if not sel then
+							actions.close(prompt_bufnr_inner)
+							return
+						end
 						local idx = sel.index
 						local mark = marks[idx].mark
-						M.jump(mark)
-						actions.close(prompt_bufnr)
+						-- close the picker first, then jump
+						actions.close(prompt_bufnr_inner)
+						pcall(M.jump, mark)
 					end)
+
+					-- Keep other mappings intact
 					return true
 				end,
 			})
