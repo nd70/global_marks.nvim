@@ -294,29 +294,36 @@ end
 -- -----------------------
 -- Jump / delete / clear / list / UI
 -- -----------------------
--- Jump to a mark, robustly landing on the marked character
--- Replace M.jump with the authoritative-getpos-at-jump version
+-- Robust jump: try getpos() first, fall back to stored M.marks if necessary
 function M.jump(mark)
 	mark = norm_mark(mark)
 	if not mark then
 		return
 	end
 
-	-- Ask Neovim for the authoritative mark position *right now*
+	-- Try authoritative getpos first
 	local ok, pos = pcall(fn.getpos, "'" .. mark)
-	if not ok or type(pos) ~= "table" then
-		print(("Failed to read position for mark '%s'"):format(mark))
-		return
+	local bufnr, row, col
+	if ok and type(pos) == "table" then
+		bufnr = tonumber(pos[1]) or 0
+		row = tonumber(pos[2]) or 0
+		col = tonumber(pos[3]) or 0
 	end
 
-	-- pos is {bufnum, lnum, col, off}
-	local bufnr = tonumber(pos[1]) or 0
-	local row = tonumber(pos[2]) or 0
-	local col = tonumber(pos[3]) or 0
+	local used_fallback = false
 
-	if bufnr == 0 or row == 0 then
-		print(("Mark '%s' is not set or has no valid position"):format(mark))
-		return
+	-- If getpos gave nothing useful, fall back to plugin stored info
+	if (not bufnr) or bufnr == 0 or row == 0 then
+		local info = M.marks[mark]
+		if info and info.bufnr and info.row and info.row > 0 then
+			bufnr = info.bufnr
+			row = info.row
+			col = tonumber(info.col) or 0
+			used_fallback = true
+		else
+			print(("Mark '%s' is not set or has no valid position"):format(mark))
+			return
+		end
 	end
 
 	if not api.nvim_buf_is_valid(bufnr) then
@@ -329,20 +336,80 @@ function M.jump(mark)
 		if api.nvim_win_get_buf(win) == bufnr then
 			api.nvim_set_current_win(win)
 
-			-- Ensure the line exists and clamp column to line byte length.
-			local line = api.nvim_buf_get_lines(bufnr, row - 1, row, true)[1] or ""
-			local byte_len = #line
-
-			-- getpos returns 1-based column (byte index). Convert to 0-based for nvim_win_set_cursor.
-			local col0 = math.max((col or 1) - 1, 0)
-
-			-- If getpos gave a column beyond the line, clamp it to the end of the line.
-			if col0 > byte_len then
-				col0 = byte_len
+			-- Clamp row
+			local rown = tonumber(row) or 1
+			if rown < 1 then
+				rown = 1
 			end
 
-			-- Finally set the cursor (row, 0-based-byte-col).
-			api.nvim_win_set_cursor(win, { row, col0 })
+			-- Read the line text (byte string)
+			local line = api.nvim_buf_get_lines(bufnr, rown - 1, rown, true)[1] or ""
+			local byte_len = #line
+
+			-- If getpos provided a column (1-based byte), use it when valid
+			local col_use = tonumber(col) or 0
+
+			if col_use and col_use >= 1 and col_use <= byte_len then
+				-- convert to 0-based for nvim_win_set_cursor
+				local col0 = math.max(col_use - 1, 0)
+				api.nvim_win_set_cursor(win, { rown, col0 })
+				if used_fallback then
+					vim.notify(
+						("global_marks: jump to '%s' used stored info (fallback)"):format(mark),
+						vim.log.levels.DEBUG
+					)
+				end
+				return
+			end
+
+			-- If stored column is 0 or out-of-range, search the line for occurrences of the mark char
+			local occurrences = {}
+			local s = 1
+			while true do
+				local start_pos = string.find(line, mark, s, true)
+				if not start_pos then
+					break
+				end
+				table.insert(occurrences, start_pos)
+				s = start_pos + 1
+			end
+
+			if #occurrences == 0 then
+				-- nothing found: clamp to end of line or use 0
+				local col0 = math.min(byte_len, math.max((col_use or 1) - 1, 0))
+				api.nvim_win_set_cursor(win, { rown, col0 })
+				if used_fallback then
+					vim.notify(
+						("global_marks: jump to '%s' used stored info but mark char not found on line"):format(mark),
+						vim.log.levels.DEBUG
+					)
+				end
+				return
+			end
+
+			-- choose occurrence closest to stored column (prefer left when tie)
+			local stored_col1 = tonumber(col) or occurrences[1] or 1
+			if stored_col1 < 1 then
+				stored_col1 = 1
+			end
+			local best = occurrences[1]
+			local best_dist = math.abs(occurrences[1] - stored_col1)
+			for _, posv in ipairs(occurrences) do
+				local dist = math.abs(posv - stored_col1)
+				if (posv <= stored_col1 and dist <= best_dist) or (posv > stored_col1 and dist < best_dist) then
+					best = posv
+					best_dist = dist
+				end
+			end
+
+			local col0 = math.max(best - 1, 0)
+			api.nvim_win_set_cursor(win, { rown, col0 })
+			if used_fallback then
+				vim.notify(
+					("global_marks: jump to '%s' used stored info (found closest occurrence)"):format(mark),
+					vim.log.levels.DEBUG
+				)
+			end
 			return
 		end
 	end
