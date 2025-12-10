@@ -15,6 +15,7 @@ M.marks = {} -- map mark -> { bufnr=, row=, col=, sign_id=, sign_name= }
 M.next_sign_id = 1000
 M.defined_signs = {} -- mark -> true when sign/hil exists
 M._fallback_installed = false
+M._palette = nil
 
 -- -----------------------
 -- Helpers: mark normalization
@@ -31,65 +32,127 @@ local function norm_mark(mark)
 end
 
 -- -----------------------
--- Color utilities
+-- Color sampling + palette logic
 -- -----------------------
--- Try to get a foreground color (hex) from common highlight groups in the current colorscheme.
-local function get_theme_fg_hex()
-	local candidates = {
-		"Identifier",
-		"Function",
-		"Constant",
-		"String",
-		"Type",
-		"Keyword",
-		"Statement",
-		"Number",
-		"Special",
-		"Boolean",
-	}
-	for _, name in ipairs(candidates) do
-		local ok, hl = pcall(vim.api.nvim_get_hl_by_name, name, true)
-		if ok and hl and hl.foreground then
-			return string.format("#%06x", hl.foreground)
-		end
-	end
-	return nil
-end
+local sample_hl_groups = {
+	"Identifier",
+	"Function",
+	"Constant",
+	"String",
+	"Type",
+	"Keyword",
+	"Statement",
+	"Number",
+	"Special",
+	"Boolean",
+	"Label",
+	"Title",
+	"Todo",
+	"Comment",
+	"Conditional",
+	"Repeat",
+	"Operator",
+	"Exception",
+	"PreProc",
+	"Include",
+	"Macro",
+	"Delimiter",
+	"Tag",
+}
 
--- fallback palette (nice for dark backgrounds)
 local fallback_palette = {
-	"#4FD6BE", -- teal
+	"#4FD6BE",
 	"#6EE7B7",
 	"#7AD3D0",
-	"#C099FF", -- mauve
+	"#C099FF",
 	"#D6B3FF",
 	"#9AE6B4",
 	"#64D3C8",
 	"#B49DFF",
+	"#6CD3D6",
+	"#5BD0C8",
+	"#8FD1B3",
+	"#D0A7FF",
 }
 
-local function palette_for_mark(mark)
-	local code = (type(mark) == "string" and string.byte(mark) or 0) or 0
-	local idx = (code % #fallback_palette) + 1
-	return fallback_palette[idx]
-end
-
--- Create or update highlight group for a mark; returns highlight group name
-local function ensure_highlight_for_mark(mark)
-	local hl_name = "GlobalMarkHL_" .. mark
-	local fg = nil
-	if M.opts.use_theme_color then
-		local ok, res = pcall(get_theme_fg_hex)
-		if ok then
-			fg = res
+local function collect_theme_colors()
+	local colors = {}
+	local seen = {}
+	for _, name in ipairs(sample_hl_groups) do
+		local ok, hl = pcall(vim.api.nvim_get_hl_by_name, name, true)
+		if ok and hl and hl.foreground then
+			local hex = string.format("#%06x", hl.foreground)
+			if not seen[hex] then
+				table.insert(colors, hex)
+				seen[hex] = true
+			end
 		end
 	end
-	if not fg then
-		fg = palette_for_mark(mark)
+	local extras = { "@function", "@keyword", "@variable", "@parameter", "@method", "@property", "@constant" }
+	for _, name in ipairs(extras) do
+		local ok, hl = pcall(vim.api.nvim_get_hl_by_name, name, true)
+		if ok and hl and hl.foreground then
+			local hex = string.format("#%06x", hl.foreground)
+			if not seen[hex] then
+				table.insert(colors, hex)
+				seen[hex] = true
+			end
+		end
 	end
-	-- Use nvim_set_hl (Neovim 0.7+). Wrap in pcall for safety.
+	if #colors == 0 then
+		for _, c in ipairs(fallback_palette) do
+			table.insert(colors, c)
+		end
+	end
+	return colors
+end
+
+local function ensure_palette()
+	if M._palette and #M._palette > 0 then
+		return M._palette
+	end
+	local pal = {}
+	if M.opts.use_theme_color ~= false then
+		local ok, colors = pcall(collect_theme_colors)
+		if ok and colors and #colors > 0 then
+			pal = colors
+		end
+	end
+	-- pad with fallback palette
+	local i = 1
+	while #pal < #fallback_palette do
+		table.insert(pal, fallback_palette[i])
+		i = i + 1
+		if i > #fallback_palette then
+			i = 1
+		end
+	end
+	M._palette = pal
+	return pal
+end
+
+local function color_for_mark(mark)
+	local pal = ensure_palette()
+	local code = (type(mark) == "string" and string.byte(mark) or 0) or 0
+	local idx = (code % #pal) + 1
+	return pal[idx]
+end
+
+local function ensure_highlight_for_mark(mark)
+	local hl_name = "GlobalMarkHL_" .. mark
+	local fg = color_for_mark(mark)
 	pcall(vim.api.nvim_set_hl, 0, hl_name, { fg = fg })
 	return hl_name
+end
+
+local function rebuild_palette_and_hls()
+	M._palette = nil
+	ensure_palette()
+	for mark, _ in pairs(M.defined_signs) do
+		local hl = ensure_highlight_for_mark(mark)
+		local sign = (M.opts.sign_prefix or "GlobalMarkSign") .. "_" .. mark
+		pcall(fn.sign_define, sign, { text = mark, texthl = hl })
+	end
 end
 
 -- -----------------------
@@ -105,7 +168,6 @@ local function define_sign_for_mark(mark)
 	end
 	local sign_name = sign_name_for_mark(mark)
 	local hl = ensure_highlight_for_mark(mark)
-	-- define sign with the mark character as text and highlight as texthl
 	pcall(fn.sign_define, sign_name, { text = mark, texthl = hl })
 	M.defined_signs[mark] = true
 	return sign_name
@@ -115,7 +177,6 @@ local function place_sign_id(id, sign_name, bufnr, row)
 	pcall(fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
 end
 
--- Place / record a mark sign
 function M.place_sign(mark, bufnr, row, col)
 	if not mark or not bufnr or not row then
 		return
@@ -132,7 +193,6 @@ function M.place_sign(mark, bufnr, row, col)
 	place_sign_id(id, sign_name, bufnr, row)
 end
 
--- Remove sign and internal record
 function M.remove_sign(mark)
 	local info = M.marks[mark]
 	if not info then
@@ -142,7 +202,6 @@ function M.remove_sign(mark)
 		pcall(fn.sign_unplace, "global_marks", { id = info.sign_id, buffer = info.bufnr })
 	end
 	M.marks[mark] = nil
-	-- keep highlight/sign definition to avoid re-defining; that is cheap
 end
 
 -- -----------------------
@@ -174,7 +233,6 @@ function M.load()
 		return
 	end
 	M.marks = dec
-	-- ensure sign ids and place signs for loaded buffers
 	for mark, info in pairs(M.marks) do
 		if not info.sign_id then
 			M.next_sign_id = M.next_sign_id + 1
@@ -189,7 +247,7 @@ function M.load()
 end
 
 -- -----------------------
--- Mark events handler
+-- Mark event handling
 -- -----------------------
 function M.on_mark_set(mark)
 	mark = norm_mark(mark)
@@ -251,7 +309,6 @@ function M.delete(mark)
 	M.remove_sign(mark)
 end
 
--- Clear marks only in loaded/open buffers (as requested)
 function M.clear()
 	local to_clear = {}
 	for m, info in pairs(M.marks) do
@@ -397,7 +454,6 @@ do
 		if not created then
 			created = try_create_markset_cmd()
 		end
-		-- cleanup detection group
 		pcall(vim.cmd, "augroup GlobalMarksDetect")
 		pcall(vim.cmd, "autocmd!")
 		pcall(vim.cmd, "augroup END")
@@ -408,17 +464,15 @@ do
 end
 
 -- -----------------------
--- Setup (call in lazy config or manually)
+-- Setup
 -- -----------------------
 function M.setup(opts)
 	if opts then
 		M.opts = vim.tbl_extend("force", M.opts, opts)
 	end
 
-	-- load persisted marks & define signs for those marks
 	M.load()
 
-	-- create real autocmd group and try to install MarkSet; if succeed, remove fallback
 	local aug = api.nvim_create_augroup("GlobalMarks", { clear = true })
 	local created = try_create_markset_api(aug)
 	if not created then
@@ -428,7 +482,6 @@ function M.setup(opts)
 		remove_fallback_mapping()
 	end
 
-	-- Save marks on exit
 	api.nvim_create_autocmd({ "VimLeavePre", "QuitPre" }, {
 		group = aug,
 		callback = function()
@@ -436,7 +489,6 @@ function M.setup(opts)
 		end,
 	})
 
-	-- Remove signs when buffers are wiped/deleted
 	api.nvim_create_autocmd({ "BufWipeout", "BufDelete" }, {
 		group = aug,
 		callback = function(ev)
@@ -449,7 +501,6 @@ function M.setup(opts)
 		end,
 	})
 
-	-- Re-place persisted signs when buffer loaded/entered
 	api.nvim_create_autocmd({ "BufReadPost", "BufWinEnter" }, {
 		group = aug,
 		callback = function(ev)
@@ -465,20 +516,13 @@ function M.setup(opts)
 		end,
 	})
 
-	-- Recompute per-mark highlights when colorscheme changes
 	api.nvim_create_autocmd("ColorScheme", {
 		group = aug,
 		callback = function()
-			for mark, _ in pairs(M.defined_signs) do
-				-- recompute highlight and redefine sign to pick up new texthl
-				local hl = ensure_highlight_for_mark(mark)
-				local sign = sign_name_for_mark(mark)
-				pcall(fn.sign_define, sign, { text = mark, texthl = hl })
-			end
+			rebuild_palette_and_hls()
 		end,
 	})
 
-	-- Commands
 	api.nvim_create_user_command("GMarksList", function()
 		M.show_list()
 	end, {})
