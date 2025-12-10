@@ -138,10 +138,30 @@ local function color_for_mark(mark)
 	return pal[idx]
 end
 
+-- Robust highlight + sign creation (replace existing functions)
+local function hex_to_rgb(hex)
+	hex = hex:gsub("#", "")
+	return tonumber(hex:sub(1, 2), 16), tonumber(hex:sub(3, 4), 16), tonumber(hex:sub(5, 6), 16)
+end
+
+local function choose_cterm_for_hex(hex)
+	-- simple heuristic: if green+blue > red -> cyan-like, else magenta-like
+	local r, g, b = hex_to_rgb(hex)
+	if (g + b) > (r * 1.1) then
+		return 6 -- cyan
+	else
+		return 13 -- magenta
+	end
+end
+
 local function ensure_highlight_for_mark(mark)
 	local hl_name = "GlobalMarkHL_" .. mark
-	local fg = color_for_mark(mark)
+	local fg = color_for_mark(mark) -- uses plugin palette function already present
+	-- set GUI color
 	pcall(vim.api.nvim_set_hl, 0, hl_name, { fg = fg })
+	-- set cterm fallback using vim.cmd highlight so ctermfg is available
+	local cterm = choose_cterm_for_hex(fg)
+	pcall(vim.cmd, string.format("highlight %s ctermfg=%d guifg=%s", hl_name, cterm, fg))
 	return hl_name
 end
 
