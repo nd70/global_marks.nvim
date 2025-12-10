@@ -222,42 +222,70 @@ function M.show_list()
 end
 
 -- Autocmds: capture MarkSet and VimLeave/VimEnter
+-- Replace your existing setup_autocmds() with this version
 function M.setup_autocmds()
-	-- MarkSet: available in Neovim; v:event.mark contains the mark name
-	vim.cmd([[
-    augroup GlobalMarks
-      autocmd! * <buffer>
-    augroup END
-  ]])
-	-- use lua callback-based autocmds
-	vim.api.nvim_create_augroup("GlobalMarks", { clear = true })
-	vim.api.nvim_create_autocmd("MarkSet", {
-		group = "GlobalMarks",
-		pattern = "*",
-		callback = function(ev)
-			-- ev.mark has the mark name, but older versions may use v:event
-			local mark = ev and ev.mark or vim.v.event and vim.v.event.mark
-			if not mark then
-				return
-			end
-			M.on_mark_set(mark)
-		end,
-	})
+	M.define_sign()
+
+	local aug = api.nvim_create_augroup("GlobalMarks", { clear = true })
+
+	-- Try to create MarkSet autocmd safely (pcall to catch 'Invalid event' errors)
+	local ok, err = pcall(function()
+		vim.api.nvim_create_autocmd("MarkSet", {
+			group = aug,
+			pattern = "*",
+			callback = function(ev)
+				local mark = ev and ev.mark or (vim.v and vim.v.event and vim.v.event.mark)
+				if not mark then
+					return
+				end
+				M.on_mark_set(mark)
+			end,
+		})
+	end)
+
+	if not ok then
+		-- Creation failed (e.g. 'Invalid event: MarkSet'). Install fallback mapping for `m`.
+		-- This keeps behavior identical for users: intercept `m{char}`, run the real `m{char}`,
+		-- and then notify the plugin about the mark.
+		vim.notify(
+			"global_marks.nvim: 'MarkSet' autocmd unavailable, using fallback mapping for `m`",
+			vim.log.levels.WARN
+		)
+
+		-- Only install fallback if we don't already have it (avoid remapping)
+		if vim.fn.has("nvim-0.10") == 0 or true then
+			-- Use feedkeys/getcharstr approach to capture the next char without blocking UI too strangely
+			vim.keymap.set("n", "m", function()
+				-- get the next char typed by user (returns string)
+				local okc, char = pcall(vim.fn.getcharstr)
+				if not okc or not char or char == "" then
+					return
+				end
+
+				-- Execute the actual mark set (no remap)
+				vim.cmd("normal! m" .. char)
+
+				-- Notify plugin
+				pcall(M.on_mark_set, char)
+			end, { noremap = true, silent = true })
+		end
+	end
+
 	-- Save marks on exit
 	vim.api.nvim_create_autocmd({ "VimLeavePre", "QuitPre" }, {
-		group = "GlobalMarks",
+		group = aug,
 		callback = function()
 			M.save()
 		end,
 	})
-	-- When buffers are wiped or unloaded, we should remove signs for marks whose buffer is gone
+
+	-- When buffers are wiped/unloaded, remove signs for marks whose buffer is gone
 	vim.api.nvim_create_autocmd({ "BufWipeout", "BufDelete" }, {
-		group = "GlobalMarks",
+		group = aug,
 		callback = function(ev)
-			local bufnr = tonumber(ev.buf)
+			local bufnr = tonumber(ev.buf) or tonumber(ev.bufnr) or api.nvim_get_current_buf()
 			for m, info in pairs(M.marks) do
 				if info.bufnr == bufnr then
-					-- remove sign but do not unset mark (user-level mark may still exist)
 					M.remove_sign(m)
 				end
 			end
