@@ -188,18 +188,39 @@ local function ensure_highlight_for_mark(mark)
 end
 
 local function define_sign_for_mark(mark)
-	if M.defined_signs[mark] then
-		return sign_name_for_mark(mark)
-	end
+	-- always ensure highlight group exists first
 	local sign_name = sign_name_for_mark(mark)
 	local hl = ensure_highlight_for_mark(mark)
-	pcall(fn.sign_define, sign_name, { text = mark, texthl = hl })
+
+	-- protect sign_define (re-define idempotently)
+	pcall(function()
+		-- sign_define will silently overwrite if already defined, that's fine
+		vim.fn.sign_define(sign_name, { text = mark, texthl = hl })
+	end)
+
 	M.defined_signs[mark] = true
 	return sign_name
 end
 
 local function place_sign_id(id, sign_name, bufnr, row)
-	pcall(fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
+	-- ensure sign is defined before placing (defensive)
+	pcall(function()
+		if not sign_name then
+			return
+		end
+		if not vim.tbl_isempty(vim.fn.sign_getdefined(sign_name)) then
+			-- sign already defined (ok)
+		else
+			-- try to define a minimal sign if somehow missing
+			pcall(vim.fn.sign_define, sign_name, { text = sign_name:sub(-1), texthl = sign_name })
+		end
+	end)
+
+	-- place sign
+	pcall(vim.fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
+
+	-- small, cheap redraw so sign renders immediately
+	pcall(vim.cmd, "redraw")
 end
 
 -- -----------------------
@@ -308,6 +329,10 @@ function M.place_sign(mark, bufnr, row, col)
 	if not mark or not bufnr or not row then
 		return
 	end
+
+	-- ensure sign & hl exist first (important for immediate rendering)
+	local sign_name = define_sign_for_mark(mark)
+
 	if is_lower_mark(mark) then
 		local tbl = ensure_lower_table(mark)
 		local key = tostring(bufnr)
@@ -319,7 +344,6 @@ function M.place_sign(mark, bufnr, row, col)
 			M.next_sign_id = M.next_sign_id + 1
 			id = M.next_sign_id
 		end
-		local sign_name = define_sign_for_mark(mark)
 		tbl[key] = { bufnr = bufnr, row = row, col = col or 0, sign_id = id, sign_name = sign_name }
 		place_sign_id(id, sign_name, bufnr, row)
 	else
@@ -330,7 +354,6 @@ function M.place_sign(mark, bufnr, row, col)
 			M.next_sign_id = M.next_sign_id + 1
 			id = M.next_sign_id
 		end
-		local sign_name = define_sign_for_mark(mark)
 		M.marks[mark] = { bufnr = bufnr, row = row, col = col or 0, sign_id = id, sign_name = sign_name }
 		place_sign_id(id, sign_name, bufnr, row)
 	end
@@ -823,20 +846,27 @@ function M.setup(opts)
 			if not bufnr or bufnr == 0 then
 				return
 			end
+
+			-- re-place any persisted signs for this buffer
 			for m, info in pairs(M.marks) do
 				if is_lower_mark(m) then
 					for k, ent in pairs(info) do
 						local nb = tonumber(k) or (ent and ent.bufnr)
 						if nb == bufnr and ent.sign_id and ent.row and ent.row > 0 then
-							place_sign_id(ent.sign_id, ent.sign_name or sign_name_for_mark(m), nb, ent.row)
+							-- ensure sign exists, then place
+							local sign_name = define_sign_for_mark(m)
+							place_sign_id(ent.sign_id, sign_name, nb, ent.row)
 						end
 					end
 				else
 					if info and info.bufnr == bufnr and info.sign_id and info.row and info.row > 0 then
-						place_sign_id(info.sign_id, info.sign_name or sign_name_for_mark(m), bufnr, info.row)
+						local sign_name = define_sign_for_mark(m)
+						place_sign_id(info.sign_id, sign_name, bufnr, info.row)
 					end
 				end
 			end
+
+			pcall(vim.cmd, "redraw")
 		end,
 	})
 
