@@ -223,52 +223,61 @@ end
 
 -- Autocmds: capture MarkSet and VimLeave/VimEnter
 -- Replace your existing setup_autocmds() with this version
+-- Robust setup_autocmds with a VimEnter retry
 function M.setup_autocmds()
 	M.define_sign()
 
 	local aug = api.nvim_create_augroup("GlobalMarks", { clear = true })
 
-	-- Try to create MarkSet autocmd safely (pcall to catch 'Invalid event' errors)
-	local ok, err = pcall(function()
-		vim.api.nvim_create_autocmd("MarkSet", {
+	-- helper to create the MarkSet autocmd, returns true on success
+	local function try_create_markset()
+		local ok, err = pcall(function()
+			vim.api.nvim_create_autocmd("MarkSet", {
+				group = aug,
+				pattern = "*",
+				callback = function(ev)
+					local mark = ev and ev.mark or (vim.v and vim.v.event and vim.v.event.mark)
+					if not mark then
+						return
+					end
+					M.on_mark_set(mark)
+				end,
+			})
+		end)
+		return ok
+	end
+
+	-- Attempt immediately
+	local created = try_create_markset()
+
+	if not created then
+		-- Schedule a retry on VimEnter (covers lazy/timing issues)
+		api.nvim_create_autocmd("VimEnter", {
 			group = aug,
-			pattern = "*",
-			callback = function(ev)
-				local mark = ev and ev.mark or (vim.v and vim.v.event and vim.v.event.mark)
-				if not mark then
-					return
+			once = true,
+			callback = function()
+				local ok = try_create_markset()
+				if not ok then
+					-- Final fallback: install `m` remap so plugin still works
+					vim.notify(
+						"global_marks.nvim: 'MarkSet' unavailable after retry, using fallback mapping for `m`",
+						vim.log.levels.WARN
+					)
+					-- Avoid remapping if it's already mapped to something else; use a flag
+					if not M._fallback_installed then
+						vim.keymap.set("n", "m", function()
+							local okc, char = pcall(vim.fn.getcharstr)
+							if not okc or not char or char == "" then
+								return
+							end
+							vim.cmd("normal! m" .. char)
+							pcall(M.on_mark_set, char)
+						end, { noremap = true, silent = true })
+						M._fallback_installed = true
+					end
 				end
-				M.on_mark_set(mark)
 			end,
 		})
-	end)
-
-	if not ok then
-		-- Creation failed (e.g. 'Invalid event: MarkSet'). Install fallback mapping for `m`.
-		-- This keeps behavior identical for users: intercept `m{char}`, run the real `m{char}`,
-		-- and then notify the plugin about the mark.
-		vim.notify(
-			"global_marks.nvim: 'MarkSet' autocmd unavailable, using fallback mapping for `m`",
-			vim.log.levels.WARN
-		)
-
-		-- Only install fallback if we don't already have it (avoid remapping)
-		if vim.fn.has("nvim-0.10") == 0 or true then
-			-- Use feedkeys/getcharstr approach to capture the next char without blocking UI too strangely
-			vim.keymap.set("n", "m", function()
-				-- get the next char typed by user (returns string)
-				local okc, char = pcall(vim.fn.getcharstr)
-				if not okc or not char or char == "" then
-					return
-				end
-
-				-- Execute the actual mark set (no remap)
-				vim.cmd("normal! m" .. char)
-
-				-- Notify plugin
-				pcall(M.on_mark_set, char)
-			end, { noremap = true, silent = true })
-		end
 	end
 
 	-- Save marks on exit
