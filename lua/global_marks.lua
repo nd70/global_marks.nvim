@@ -294,29 +294,59 @@ end
 -- -----------------------
 -- Jump / delete / clear / list / UI
 -- -----------------------
+-- Jump to a mark, robustly landing on the marked character
+-- Replace M.jump with the authoritative-getpos-at-jump version
 function M.jump(mark)
 	mark = norm_mark(mark)
 	if not mark then
 		return
 	end
-	local info = M.marks[mark]
-	if not info then
-		print(("Mark '%s' not registered."):format(mark))
+
+	-- Ask Neovim for the authoritative mark position *right now*
+	local ok, pos = pcall(fn.getpos, "'" .. mark)
+	if not ok or type(pos) ~= "table" then
+		print(("Failed to read position for mark '%s'"):format(mark))
 		return
 	end
-	local bufnr = info.bufnr
-	if not bufnr or not api.nvim_buf_is_valid(bufnr) then
-		print(("Target buffer for mark '%s' is not valid/loaded."):format(mark))
+
+	-- pos is {bufnum, lnum, col, off}
+	local bufnr = tonumber(pos[1]) or 0
+	local row = tonumber(pos[2]) or 0
+	local col = tonumber(pos[3]) or 0
+
+	if bufnr == 0 or row == 0 then
+		print(("Mark '%s' is not set or has no valid position"):format(mark))
 		return
 	end
+
+	if not api.nvim_buf_is_valid(bufnr) then
+		print(("Buffer for mark '%s' is not valid"):format(mark))
+		return
+	end
+
+	-- Find a window showing that buffer
 	for _, win in ipairs(api.nvim_list_wins()) do
 		if api.nvim_win_get_buf(win) == bufnr then
 			api.nvim_set_current_win(win)
-			local col0 = math.max((info.col or 1) - 1, 0) -- nvim_win_set_cursor expects 0-index col
-			api.nvim_win_set_cursor(win, { info.row, col0 })
+
+			-- Ensure the line exists and clamp column to line byte length.
+			local line = api.nvim_buf_get_lines(bufnr, row - 1, row, true)[1] or ""
+			local byte_len = #line
+
+			-- getpos returns 1-based column (byte index). Convert to 0-based for nvim_win_set_cursor.
+			local col0 = math.max((col or 1) - 1, 0)
+
+			-- If getpos gave a column beyond the line, clamp it to the end of the line.
+			if col0 > byte_len then
+				col0 = byte_len
+			end
+
+			-- Finally set the cursor (row, 0-based-byte-col).
+			api.nvim_win_set_cursor(win, { row, col0 })
 			return
 		end
 	end
+
 	print(("Buffer for mark '%s' is not open in any split. Open it to jump."):format(mark))
 end
 
