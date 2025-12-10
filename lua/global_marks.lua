@@ -382,21 +382,18 @@ function M.show_list()
 				finder = finders.new_table({ results = choices }),
 				sorter = conf.generic_sorter({}),
 				attach_mappings = function(prompt_bufnr, map)
-					-- Replace default select action with one that closes the picker correctly
-					actions.select_default:replace(function(prompt_bufnr_inner, map_inner)
+					actions.select_default:replace(function()
 						local sel = action_state.get_selected_entry()
 						if not sel then
-							actions.close(prompt_bufnr_inner)
+							actions.close(prompt_bufnr)
 							return
 						end
 						local idx = sel.index
 						local mark = marks[idx].mark
-						-- close the picker first, then jump
-						actions.close(prompt_bufnr_inner)
+						actions.close(prompt_bufnr)
 						pcall(M.jump, mark)
 					end)
 
-					-- Keep other mappings intact
 					return true
 				end,
 			})
