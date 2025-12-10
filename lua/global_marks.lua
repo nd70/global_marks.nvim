@@ -2,7 +2,7 @@ local M = {}
 local api = vim.api
 local fn = vim.fn
 
--- Config defaults
+-- config defaults
 M.opts = {
 	sign_name = "GlobalMarkSign",
 	sign_text = "●",
@@ -10,13 +10,13 @@ M.opts = {
 	sign_priority = 10,
 }
 
--- Internal state
--- marks: map from mark char -> {bufnr=, row=, col=, sign_id=}
-M.marks = {}
+-- state
+M.marks = {} -- map mark -> {bufnr=, row=, col=, sign_id=}
 M.next_sign_id = 1000
 M._fallback_installed = false
+M._fallback_source = "module_load" -- reason we installed fallback
 
--- Normalize single-character mark
+-- helpers
 local function norm_mark(mark)
 	if not mark then
 		return nil
@@ -28,9 +28,43 @@ local function norm_mark(mark)
 	return s:sub(1, 1)
 end
 
--- Persist marks to disk (JSON)
+function M.define_sign()
+	pcall(fn.sign_define, M.opts.sign_name, { text = M.opts.sign_text, texthl = "Comment" })
+end
+
+local function place_sign_id(id, bufnr, row)
+	pcall(fn.sign_place, id, "global_marks", M.opts.sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
+end
+
+function M.place_sign(mark, bufnr, row, col)
+	if not mark or not bufnr or not row then
+		return
+	end
+	local id = nil
+	if M.marks[mark] and M.marks[mark].sign_id then
+		id = M.marks[mark].sign_id
+	else
+		M.next_sign_id = M.next_sign_id + 1
+		id = M.next_sign_id
+	end
+	M.marks[mark] = { bufnr = bufnr, row = row, col = col or 0, sign_id = id }
+	place_sign_id(id, bufnr, row)
+end
+
+function M.remove_sign(mark)
+	local info = M.marks[mark]
+	if not info then
+		return
+	end
+	if info.sign_id and info.bufnr then
+		pcall(fn.sign_unplace, "global_marks", { id = info.sign_id, buffer = info.bufnr })
+	end
+	M.marks[mark] = nil
+end
+
+-- persistence
 function M.save()
-	local ok, json = pcall(vim.fn.json_encode, M.marks)
+	local ok, json = pcall(fn.json_encode, M.marks)
 	if not ok or not json then
 		return
 	end
@@ -43,7 +77,6 @@ function M.save()
 	fd:close()
 end
 
--- Load persisted marks
 function M.load()
 	local fd = io.open(M.opts.persist_file, "r")
 	if not fd then
@@ -51,103 +84,56 @@ function M.load()
 	end
 	local content = fd:read("*a")
 	fd:close()
-	local ok, tbl = pcall(vim.fn.json_decode, content)
-	if not ok or type(tbl) ~= "table" then
+	local ok, dec = pcall(fn.json_decode, content)
+	if not ok or type(dec) ~= "table" then
 		return
 	end
-	M.marks = tbl
-	-- ensure sign_ids exist and place signs for loaded buffers that are currently loaded
+	M.marks = dec
+	-- ensure sign ids
 	for mark, info in pairs(M.marks) do
 		if not info.sign_id then
 			M.next_sign_id = M.next_sign_id + 1
 			info.sign_id = M.next_sign_id
 		end
-		if api.nvim_buf_is_loaded(info.bufnr) and api.nvim_buf_is_valid(info.bufnr) and info.row and info.row > 0 then
-			pcall(
-				fn.sign_place,
-				info.sign_id,
-				"global_marks",
-				M.opts.sign_name,
-				info.bufnr,
-				{ lnum = info.row, priority = M.opts.sign_priority }
-			)
+		if info.bufnr and api.nvim_buf_is_loaded(info.bufnr) and info.row and info.row > 0 then
+			place_sign_id(info.sign_id, info.bufnr, info.row)
 		end
 	end
 end
 
--- Define sign used in gutter
-function M.define_sign()
-	pcall(fn.sign_define, M.opts.sign_name, { text = M.opts.sign_text, texthl = "Comment" })
-end
-
--- Place/record sign for a mark
-function M.place_sign(mark, bufnr, row, col)
-	if not mark or not bufnr or not row then
-		return
-	end
-	local id = nil
-	if M.marks[mark] and M.marks[mark].sign_id then
-		id = M.marks[mark].sign_id
-	else
-		M.next_sign_id = M.next_sign_id + 1
-		id = M.next_sign_id
-	end
-	-- store
-	M.marks[mark] = { buf = nil, bufnr = bufnr, row = row, col = col or 0, sign_id = id }
-	-- place sign (pcall to avoid crashing)
-	pcall(fn.sign_place, id, "global_marks", M.opts.sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
-end
-
--- Remove sign and internal record for a mark
-function M.remove_sign(mark)
-	local info = M.marks[mark]
-	if not info then
-		return
-	end
-	if info.sign_id and info.bufnr then
-		pcall(fn.sign_unplace, "global_marks", { id = info.sign_id, buffer = info.bufnr })
-	end
-	M.marks[mark] = nil
-end
-
--- Called when a mark is set (either via MarkSet autocmd or fallback mapping)
+-- mark handling: called by MarkSet autocmd or fallback mapping
 function M.on_mark_set(mark)
 	mark = norm_mark(mark)
 	if not mark then
 		return
 	end
 
-	-- Try to get position: getpos("'x")
+	-- getpos("'x") -> {bufnum, lnum, col, off}
 	local ok, pos = pcall(fn.getpos, "'" .. mark)
 	if not ok or type(pos) ~= "table" then
-		vim.notify("global_marks: getpos failed for mark '" .. tostring(mark) .. "'", vim.log.levels.DEBUG)
+		-- if getpos fails, abort quietly
 		return
 	end
 
-	-- pos is typically {bufnum, lnum, col, off}
 	local bufnr = tonumber(pos[1]) or api.nvim_get_current_buf()
 	local row = tonumber(pos[2]) or 0
 	local col = tonumber(pos[3]) or 0
 
-	-- Debug notification (low-verbosity)
-	--vim.notify(("global_marks: on_mark_set mark=%s pos=%s buf=%s row=%s col=%s"):format(mark, vim.inspect(pos), tostring(bufnr), tostring(row), tostring(col)), vim.log.levels.DEBUG)
-
-	-- If row==0 -> treat as deletion/invalid
+	-- treat row==0 as a deletion/unset
 	if row == 0 then
 		M.remove_sign(mark)
 		return
 	end
 
-	-- enforce buffer-local semantics for lowercase marks
+	-- buffer-local semantics for lowercase
 	if mark:match("%l") then
 		bufnr = api.nvim_get_current_buf()
 	end
 
-	-- place sign and record
 	M.place_sign(mark, bufnr, row, col)
 end
 
--- Jump to a registered mark (only if its buffer is visible in an open window)
+-- Jump: only if mark's buffer is visible in an open window
 function M.jump(mark)
 	mark = norm_mark(mark)
 	if not mark then
@@ -155,37 +141,33 @@ function M.jump(mark)
 	end
 	local info = M.marks[mark]
 	if not info then
-		print("Mark '" .. mark .. "' not registered.")
+		print(("Mark '%s' not registered"):format(mark))
 		return
 	end
-	local target_buf = info.bufnr
-	if not target_buf or not api.nvim_buf_is_valid(target_buf) then
-		print("Target buffer for mark '" .. mark .. "' is not valid or not loaded.")
+	local bufnr = info.bufnr
+	if not bufnr or not api.nvim_buf_is_valid(bufnr) then
+		print(("Target buffer for mark '%s' is not valid/loaded"):format(mark))
 		return
 	end
 	for _, win in ipairs(api.nvim_list_wins()) do
-		if api.nvim_win_get_buf(win) == target_buf then
+		if api.nvim_win_get_buf(win) == bufnr then
 			api.nvim_set_current_win(win)
 			api.nvim_win_set_cursor(win, { info.row, info.col or 0 })
 			return
 		end
 	end
-	print("Buffer for mark '" .. mark .. "' is not open in any split. Open the buffer first to jump.")
+	print(("Buffer for mark '%s' is not open in any split (open it to jump)"):format(mark))
 end
 
--- Delete/unset a mark (remove sign + unset actual vim mark)
 function M.delete(mark)
 	mark = norm_mark(mark)
 	if not mark then
 		return
 	end
-	-- attempt to unset the actual vim mark
 	pcall(fn.setpos, "'" .. mark, { 0, 0, 0, 0 })
-	-- remove sign/internal
 	M.remove_sign(mark)
 end
 
--- Return list of marks as an array
 function M.list()
 	local out = {}
 	for m, info in pairs(M.marks) do
@@ -197,7 +179,6 @@ function M.list()
 	return out
 end
 
--- UI: show marks (Telescope if available, else simple print)
 function M.show_list()
 	local marks = M.list()
 	if vim.tbl_isempty(marks) then
@@ -220,7 +201,6 @@ function M.show_list()
 		local conf = require("telescope.config").values
 		local actions = require("telescope.actions")
 		local action_state = require("telescope.actions.state")
-
 		pickers
 			.new({}, {
 				prompt_title = "Global Marks",
@@ -241,85 +221,123 @@ function M.show_list()
 		return
 	end
 
-	-- fallback: print simple list
 	for i, v in ipairs(choices) do
 		print(i .. ": " .. v)
 	end
 end
 
--- Attempt to create MarkSet via API; fallback to vimscript autocmd if necessary.
--- If both fail, install a safe fallback mapping for 'm' that preserves builtin behavior.
+-- Try to create MarkSet autocmd via API, or via vimscript cmd
+local function try_create_markset_api(aug)
+	local ok = pcall(function()
+		api.nvim_create_autocmd("MarkSet", {
+			group = aug,
+			pattern = "*",
+			callback = function(ev)
+				local mark = ev and ev.mark or (vim.v and vim.v.event and vim.v.event.mark)
+				if not mark then
+					return
+				end
+				M.on_mark_set(mark)
+			end,
+		})
+	end)
+	return ok
+end
+
+local function try_create_markset_cmd()
+	-- safer vimscript-style autocmd
+	local ok1 = pcall(vim.cmd, "augroup GlobalMarks")
+	local ok2 = pcall(vim.cmd, "autocmd! GlobalMarks")
+	local ok3 = pcall(
+		vim.cmd,
+		"autocmd MarkSet * lua require('global_marks').on_mark_set(vim.v.event and vim.v.event.mark or '')"
+	)
+	local ok4 = pcall(vim.cmd, "augroup END")
+	return ok1 and ok2 and ok3 and ok4
+end
+
+-- fallback mapping management
+local function install_fallback_mapping(reason)
+	-- don't override if user already mapped 'm'
+	local maps = api.nvim_get_keymap("n")
+	for _, mp in ipairs(maps) do
+		if mp.lhs == "m" then
+			-- Do not install fallback; user mapping exists
+			return false
+		end
+	end
+	-- remove any previous mapping we may have left
+	pcall(api.nvim_del_keymap, "n", "m")
+	api.nvim_set_keymap("n", "m", "", {
+		callback = function()
+			local ok, ch = pcall(fn.getcharstr)
+			if not ok or not ch or ch == "" then
+				return
+			end
+			pcall(fn.execute, "normal! m" .. ch) -- use execute to be safe
+			local loaded, gm = pcall(require, "global_marks")
+			if loaded and gm and type(gm.on_mark_set) == "function" then
+				pcall(gm.on_mark_set, ch)
+			end
+		end,
+		noremap = true,
+		silent = true,
+	})
+	M._fallback_installed = true
+	M._fallback_source = reason or "module_load"
+	return true
+end
+
+local function remove_fallback_mapping()
+	if M._fallback_installed then
+		pcall(api.nvim_del_keymap, "n", "m")
+		M._fallback_installed = false
+		M._fallback_source = nil
+	end
+end
+
+-- Attempt to create MarkSet immediately; if not possible, install fallback mapping now.
+-- Doing this at module-load time ensures marks work even before lazy loads setup().
+do
+	M.define_sign()
+	-- create a transient augroup for detection
+	local aug_ok, aug = pcall(api.nvim_create_augroup, "GlobalMarksDetect", { clear = true })
+	if not aug_ok then
+		aug = nil
+	end
+
+	local created = false
+	if aug then
+		created = try_create_markset_api(aug)
+		if not created then
+			created = try_create_markset_cmd()
+		end
+		-- clean up detection augroup if it exists; real setup will create the final one
+		pcall(vim.cmd, "augroup GlobalMarksDetect")
+		pcall(vim.cmd, "autocmd!")
+		pcall(vim.cmd, "augroup END")
+	end
+
+	if not created then
+		-- install safe fallback mapping immediately
+		install_fallback_mapping("module_load")
+	end
+end
+
+-- setup autocmds and commands (called in setup)
 function M.setup_autocmds()
 	M.define_sign()
-
 	local aug = api.nvim_create_augroup("GlobalMarks", { clear = true })
 
-	local function try_create_markset_api()
-		local ok, _ = pcall(function()
-			vim.api.nvim_create_autocmd("MarkSet", {
-				group = aug,
-				pattern = "*",
-				callback = function(ev)
-					local mark = ev and ev.mark or (vim.v and vim.v.event and vim.v.event.mark)
-					if not mark then
-						return
-					end
-					M.on_mark_set(mark)
-				end,
-			})
-		end)
-		return ok
-	end
-
-	local function try_create_markset_cmd()
-		-- Use a vimscript-style autocmd that calls back into our Lua function.
-		local ok, _ = pcall(vim.cmd, "augroup GlobalMarks")
-		ok, _ = pcall(vim.cmd, "autocmd! GlobalMarks")
-		ok, _ = pcall(
-			vim.cmd,
-			"autocmd MarkSet * lua require('global_marks').on_mark_set(vim.v.event and vim.v.event.mark or '')"
-		)
-		ok, _ = pcall(vim.cmd, "augroup END")
-		return ok
-	end
-
-	local created = try_create_markset_api()
+	-- attempt to create real MarkSet autocmd (api then cmd)
+	local created = try_create_markset_api(aug)
 	if not created then
 		created = try_create_markset_cmd()
 	end
 
-	if not created then
-		-- install fallback mapping only if safe to do so
-		if not M._fallback_installed then
-			vim.notify(
-				"global_marks.nvim: 'MarkSet' unavailable, installing fallback mapping for `m`",
-				vim.log.levels.WARN
-			)
-			local maps = vim.api.nvim_get_keymap("n")
-			local m_mapped = false
-			for _, mp in ipairs(maps) do
-				if mp.lhs == "m" then
-					m_mapped = true
-					break
-				end
-			end
-			if not m_mapped then
-				vim.keymap.set("n", "m", function()
-					local okc, ch = pcall(vim.fn.getcharstr)
-					if not okc or not ch or ch == "" then
-						return
-					end
-					vim.cmd("normal! m" .. ch)
-					local loaded, gm = pcall(require, "global_marks")
-					if loaded and gm and type(gm.on_mark_set) == "function" then
-						pcall(gm.on_mark_set, ch)
-					end
-				end, { noremap = true, silent = true })
-				M._fallback_installed = true
-			else
-				vim.notify("global_marks.nvim: 'm' already mapped; fallback not installed", vim.log.levels.WARN)
-			end
-		end
+	-- if we created MarkSet now and had fallback mapping earlier, remove fallback
+	if created and M._fallback_installed then
+		remove_fallback_mapping()
 	end
 
 	-- Save marks on exit
@@ -343,7 +361,7 @@ function M.setup_autocmds()
 		end,
 	})
 
-	-- When a buffer is read/loaded, re-place any saved signs for that buffer (helps persistence)
+	-- When buffers are read/entered, re-place persisted signs for that buffer
 	api.nvim_create_autocmd({ "BufReadPost", "BufWinEnter" }, {
 		group = aug,
 		callback = function(ev)
@@ -372,11 +390,11 @@ function M.setup(opts)
 	if opts then
 		M.opts = vim.tbl_extend("force", M.opts, opts)
 	end
-	M.define_sign()
+	-- load persisted marks and try to create autocmds; if MarkSet is available we will remove fallback.
 	M.load()
 	M.setup_autocmds()
 
-	-- User commands
+	-- user commands
 	api.nvim_create_user_command("GMarksList", function()
 		M.show_list()
 	end, {})
