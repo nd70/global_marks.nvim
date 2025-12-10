@@ -187,7 +187,7 @@ local function ensure_highlight_for_mark(mark)
 	return hl_name
 end
 
--- Defensive sign definition: make sure text is exactly one character
+-- Defensive sign definition (ensure single-char text)
 local function define_sign_for_mark(mark)
 	if M.defined_signs[mark] then
 		return sign_name_for_mark(mark)
@@ -195,11 +195,8 @@ local function define_sign_for_mark(mark)
 
 	local sign_name = sign_name_for_mark(mark)
 	local hl = ensure_highlight_for_mark(mark)
-
-	-- Ensure we use exactly the first character (no trailing spaces)
 	local text = tostring(mark):sub(1, 1)
 
-	-- pcall to be safe; sign_define will overwrite an existing definition
 	pcall(function()
 		vim.fn.sign_define(sign_name, { text = text, texthl = hl })
 	end)
@@ -208,73 +205,86 @@ local function define_sign_for_mark(mark)
 	return sign_name
 end
 
--- Place sign and verify it is visible; retry once if needed
+-- Place sign and verify with immediate + deferred retries
 local function place_sign_id(id, sign_name, bufnr, row)
 	if not sign_name or not bufnr or not row then
 		return
 	end
 
-	-- Place sign
-	pcall(vim.fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
+	local function do_place_once()
+		pcall(vim.fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
+		-- best-effort redraw scoped to windows showing the buffer
+		for _, win in ipairs(api.nvim_list_wins()) do
+			if api.nvim_win_get_buf(win) == bufnr then
+				pcall(api.nvim_win_call, win, function()
+					vim.cmd("redraw")
+				end)
+			end
+		end
+	end
 
-	-- Force a redraw (cheap)
-	pcall(vim.cmd, "redraw")
-
-	-- Verify placement: sign_getplaced returns a table with placed signs
-	local placed = nil
-	local ok = pcall(function()
-		placed = vim.fn.sign_getplaced(bufnr, { group = "global_marks" })
-	end)
-
-	local function has_our_sign()
-		if type(placed) ~= "table" or #placed == 0 then
+	local function sign_is_present()
+		local ok, placed = pcall(function()
+			return vim.fn.sign_getplaced(bufnr, { group = "global_marks" })
+		end)
+		if not ok or type(placed) ~= "table" or #placed == 0 then
 			return false
 		end
-		local entry = placed[1]
-		if not entry or type(entry.signs) ~= "table" then
-			return false
-		end
-		for _, s in ipairs(entry.signs) do
-			if s and (s.id == id or s.name == sign_name) then
-				return true
+		for _, entry in ipairs(placed) do
+			for _, s in ipairs(entry.signs or {}) do
+				if s and (s.id == id or s.name == sign_name) then
+					return true
+				end
 			end
 		end
 		return false
 	end
 
-	if not ok or not has_our_sign() then
-		-- Retry once: re-define and re-place, then redraw
+	-- 1) initial place
+	do_place_once()
+
+	-- 2) immediate check + synchronous retry if missing
+	if not sign_is_present() then
+		-- re-define defensively (single-char text) then re-place
 		pcall(vim.fn.sign_define, sign_name, { text = tostring(sign_name):sub(-1), texthl = sign_name })
-		pcall(vim.fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
-		pcall(vim.cmd, "redraw")
+		do_place_once()
+	end
 
-		-- Re-check
-		local placed2 = nil
-		local ok2 = pcall(function()
-			placed2 = vim.fn.sign_getplaced(bufnr, { group = "global_marks" })
-		end)
-		local success = false
-		if ok2 and type(placed2) == "table" and #placed2 > 0 then
-			for _, s in ipairs(placed2[1].signs or {}) do
-				if s and (s.id == id or s.name == sign_name) then
-					success = true
-					break
-				end
+	-- 3) schedule deferred retries to handle event-loop races (0ms then 20ms)
+	-- These are tiny and safe; they'll only run if sign still missing.
+	local function deferred_try(delay_ms)
+		vim.defer_fn(function()
+			if sign_is_present() then
+				return
 			end
-		end
+			pcall(vim.fn.sign_define, sign_name, { text = tostring(sign_name):sub(-1), texthl = sign_name })
+			do_place_once()
+			if not sign_is_present() then
+				-- final redraw across windows showing buffer
+				for _, win in ipairs(api.nvim_list_wins()) do
+					if api.nvim_win_get_buf(win) == bufnr then
+						pcall(api.nvim_win_call, win, function()
+							vim.cmd("redraw")
+						end)
+					end
+				end
+				vim.notify(
+					("global_marks: sign %s (id=%s) still not visible after retries on buf %s line %s"):format(
+						sign_name,
+						tostring(id),
+						tostring(bufnr),
+						tostring(row)
+					),
+					vim.log.levels.DEBUG
+				)
+			end
+		end, delay_ms)
+	end
 
-		if not success then
-			-- Debug message so you can see it in :messages (level DEBUG so it's quiet by default)
-			vim.notify(
-				("global_marks: sign %s (id=%s) failed to appear on buf %s line %s"):format(
-					sign_name,
-					tostring(id),
-					tostring(bufnr),
-					tostring(row)
-				),
-				vim.log.levels.DEBUG
-			)
-		end
+	-- only schedule if still missing after sync attempts
+	if not sign_is_present() then
+		deferred_try(0)
+		deferred_try(20)
 	end
 end
 
