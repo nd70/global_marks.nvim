@@ -158,7 +158,7 @@ function M.rebuild_palette_and_hls()
 		local fg = color_for_mark(mark)
 		pcall(vim.api.nvim_set_hl, 0, hl, { fg = fg })
 		local sign = sign_name_for_mark(mark)
-		pcall(fn.sign_define, sign, { text = mark, texthl = hl })
+		pcall(fn.sign_define, sign, { text = mark:sub(1, 1), texthl = hl })
 	end
 end
 
@@ -183,44 +183,99 @@ local function ensure_highlight_for_mark(mark)
 			return 13
 		end
 	end
-	local ok, _ = pcall(vim.cmd, string.format("highlight %s ctermfg=%d guifg=%s", hl_name, choose_cterm(fg), fg))
+	pcall(vim.cmd, string.format("highlight %s ctermfg=%d guifg=%s", hl_name, choose_cterm(fg), fg))
 	return hl_name
 end
 
+-- Defensive sign definition: make sure text is exactly one character
 local function define_sign_for_mark(mark)
-	-- always ensure highlight group exists first
+	if M.defined_signs[mark] then
+		return sign_name_for_mark(mark)
+	end
+
 	local sign_name = sign_name_for_mark(mark)
 	local hl = ensure_highlight_for_mark(mark)
 
-	-- protect sign_define (re-define idempotently)
+	-- Ensure we use exactly the first character (no trailing spaces)
+	local text = tostring(mark):sub(1, 1)
+
+	-- pcall to be safe; sign_define will overwrite an existing definition
 	pcall(function()
-		-- sign_define will silently overwrite if already defined, that's fine
-		vim.fn.sign_define(sign_name, { text = mark, texthl = hl })
+		vim.fn.sign_define(sign_name, { text = text, texthl = hl })
 	end)
 
 	M.defined_signs[mark] = true
 	return sign_name
 end
 
+-- Place sign and verify it is visible; retry once if needed
 local function place_sign_id(id, sign_name, bufnr, row)
-	-- ensure sign is defined before placing (defensive)
-	pcall(function()
-		if not sign_name then
-			return
-		end
-		if not vim.tbl_isempty(vim.fn.sign_getdefined(sign_name)) then
-			-- sign already defined (ok)
-		else
-			-- try to define a minimal sign if somehow missing
-			pcall(vim.fn.sign_define, sign_name, { text = sign_name:sub(-1), texthl = sign_name })
-		end
-	end)
+	if not sign_name or not bufnr or not row then
+		return
+	end
 
-	-- place sign
+	-- Place sign
 	pcall(vim.fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
 
-	-- small, cheap redraw so sign renders immediately
+	-- Force a redraw (cheap)
 	pcall(vim.cmd, "redraw")
+
+	-- Verify placement: sign_getplaced returns a table with placed signs
+	local placed = nil
+	local ok = pcall(function()
+		placed = vim.fn.sign_getplaced(bufnr, { group = "global_marks" })
+	end)
+
+	local function has_our_sign()
+		if type(placed) ~= "table" or #placed == 0 then
+			return false
+		end
+		local entry = placed[1]
+		if not entry or type(entry.signs) ~= "table" then
+			return false
+		end
+		for _, s in ipairs(entry.signs) do
+			if s and (s.id == id or s.name == sign_name) then
+				return true
+			end
+		end
+		return false
+	end
+
+	if not ok or not has_our_sign() then
+		-- Retry once: re-define and re-place, then redraw
+		pcall(vim.fn.sign_define, sign_name, { text = tostring(sign_name):sub(-1), texthl = sign_name })
+		pcall(vim.fn.sign_place, id, "global_marks", sign_name, bufnr, { lnum = row, priority = M.opts.sign_priority })
+		pcall(vim.cmd, "redraw")
+
+		-- Re-check
+		local placed2 = nil
+		local ok2 = pcall(function()
+			placed2 = vim.fn.sign_getplaced(bufnr, { group = "global_marks" })
+		end)
+		local success = false
+		if ok2 and type(placed2) == "table" and #placed2 > 0 then
+			for _, s in ipairs(placed2[1].signs or {}) do
+				if s and (s.id == id or s.name == sign_name) then
+					success = true
+					break
+				end
+			end
+		end
+
+		if not success then
+			-- Debug message so you can see it in :messages (level DEBUG so it's quiet by default)
+			vim.notify(
+				("global_marks: sign %s (id=%s) failed to appear on buf %s line %s"):format(
+					sign_name,
+					tostring(id),
+					tostring(bufnr),
+					tostring(row)
+				),
+				vim.log.levels.DEBUG
+			)
+		end
+	end
 end
 
 -- -----------------------
@@ -846,14 +901,11 @@ function M.setup(opts)
 			if not bufnr or bufnr == 0 then
 				return
 			end
-
-			-- re-place any persisted signs for this buffer
 			for m, info in pairs(M.marks) do
 				if is_lower_mark(m) then
 					for k, ent in pairs(info) do
 						local nb = tonumber(k) or (ent and ent.bufnr)
 						if nb == bufnr and ent.sign_id and ent.row and ent.row > 0 then
-							-- ensure sign exists, then place
 							local sign_name = define_sign_for_mark(m)
 							place_sign_id(ent.sign_id, sign_name, nb, ent.row)
 						end
@@ -861,11 +913,10 @@ function M.setup(opts)
 				else
 					if info and info.bufnr == bufnr and info.sign_id and info.row and info.row > 0 then
 						local sign_name = define_sign_for_mark(m)
-						place_sign_id(info.sign_id, sign_name, bufnr, info.row)
+						place_sign_id(info.sign_id, info.sign_name or sign_name_for_mark(m), bufnr, info.row)
 					end
 				end
 			end
-
 			pcall(vim.cmd, "redraw")
 		end,
 	})
@@ -905,9 +956,10 @@ function M.setup(opts)
 	end, {})
 end
 
--- expose API
+-- expose some helpers for debugging
 M.place_sign_id = place_sign_id
 M.define_sign_for_mark = define_sign_for_mark
 M.ensure_highlight_for_mark = ensure_highlight_for_mark
+M.color_for_mark = color_for_mark
 
 return M
