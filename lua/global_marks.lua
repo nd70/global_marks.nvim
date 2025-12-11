@@ -705,16 +705,48 @@ function M.list()
 	return out
 end
 
+-- Safe replacement for M.show_list()
 function M.show_list()
 	local marks = M.list()
 	if vim.tbl_isempty(marks) then
 		print("No global marks registered.")
 		return
 	end
+
 	local choices = {}
 	for _, v in ipairs(marks) do
-		local name = api.nvim_buf_get_name(v.bufnr) or ""
-		if name == "" then
+		local name = nil
+		if v.bufnr and type(v.bufnr) == "number" and api.nvim_buf_is_valid(v.bufnr) then
+			-- safe to call nvim_buf_get_name
+			name = api.nvim_buf_get_name(v.bufnr)
+		else
+			-- buffer invalid or nil — try to obtain a friendly fallback
+			-- try to look up the stored info in M.marks to get a file name if available
+			local fallback = "[No Name]"
+			local stored_info = nil
+			if v.mark and is_lower_mark(v.mark) then
+				local t = M.marks[v.mark]
+				if t and type(t) == "table" then
+					local ent = t[tostring(v.bufnr)] or next(t) -- try the specific key, else any
+					stored_info = ent
+				end
+			else
+				stored_info = M.marks[v.mark]
+			end
+			if stored_info and type(stored_info) == "table" then
+				-- prefer any stored filename field if plugin stored it; otherwise show buffer id
+				if stored_info.name and stored_info.name ~= "" then
+					fallback = stored_info.name
+				elseif v.bufnr then
+					fallback = string.format("[Buf %s]", tostring(v.bufnr))
+				end
+			elseif v.bufnr then
+				fallback = string.format("[Buf %s]", tostring(v.bufnr))
+			end
+			name = fallback
+		end
+
+		if name == "" or not name then
 			name = "[No Name]"
 		end
 		table.insert(choices, string.format("%s — %s:%d", v.mark, name, v.row or 0))
